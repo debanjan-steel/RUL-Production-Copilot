@@ -1,0 +1,22 @@
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# Datasets and heavy model artifacts
+data/
+checkpoints/
+*.pt
+*.h5
+*.pth
+
+# Environment variables
+.env
+
+# MLflow tracking data
+mlruns/
