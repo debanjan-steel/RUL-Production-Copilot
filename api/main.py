@@ -1,64 +1,113 @@
+"""FastAPI Serving Layer for Uncertainty-Aware Turbofan RUL Prediction.
+
+Exposes REST endpoints for real-time inference, Monte Carlo Dropout uncertainty
+estimation, feature attribution, and grounded Copilot recommendations.
+"""
+
+from pathlib import Path
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-import numpy as np
+import torch
 
-# In a real environment, you will import these from your src folders:
-# from src.models.cnn_transformer import CNNTransformer
-# from src.preprocess import preprocess_sensor_data
-# from src.copilot.agent import evaluate_uncertainty
+from api.schemas import PredictionRequest, PredictionResponse, HealthResponse
+from src.preprocess import CmapssPreprocessor
+from src.models.cnn_transformer import CNNTransformer
+from src.copilot.agent import OpsCopilotAgent
 
-app = FastAPI(title="RUL Copilot API", version="1.0.0")
+app = FastAPI(
+    title="Predictive Maintenance RUL OpsCopilot API",
+    description="Production-grade API serving a Multi-Scale CNN-Transformer with Bayesian UQ and safety guardrails.",
+    version="1.0.0",
+)
 
-# 1. Define the Expected Input Structure using Pydantic
-class SensorDataInput(BaseModel):
-    engine_id: int
-    cycle: int
-    sensor_readings: list[float]
+# Global runtime state
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+preprocessor = CmapssPreprocessor(sequence_length=30)
+model = CNNTransformer(in_features=14, d_model=64, nhead=4, num_layers=2).to(DEVICE)
+agent = OpsCopilotAgent(uncertainty_threshold=18.0)
 
-# 2. Define the Output Structure
-class PredictionOutput(BaseModel):
-    engine_id: int
-    predicted_rul: float
-    uncertainty_std: float
-    recommendation: str
-    status: str
-
-# 3. Dummy functions to simulate your src logic until we connect them
-def mock_preprocess(data):
-    return data
-
-def mock_predict(data):
-    # Simulating 50 MC Dropout passes returning random variations of RUL
-    return np.random.normal(loc=120, scale=15, size=50)
-
-def mock_evaluate(mean_rul, uncertainty):
-    if uncertainty > 20:
-        return "ESCALATE_TO_HUMAN", "Uncertainty too high. Manual inspection required."
-    return "CONFIDENT", f"Run standard maintenance in {int(mean_rul)} cycles."
-
-@app.post("/predict", response_model=PredictionOutput)
-async def predict_rul(data: SensorDataInput):
+# Check if pre-trained checkpoint exists
+CHECKPOINT_PATH = Path(__file__).resolve().parent.parent / "checkpoints" / "best_model.pt"
+if CHECKPOINT_PATH.exists():
     try:
-        # Step 1: Preprocess
-        processed_input = mock_preprocess(data.sensor_readings)
+        model.load_state_dict(torch.load(CHECKPOINT_PATH, map_location=DEVICE))
+        model.eval()
+    except Exception as e:
+        print(f"Warning: Could not load checkpoint from {CHECKPOINT_PATH}: {e}")
+else:
+    model.eval()
 
-        # Step 2: MC Dropout Inference
-        predictions = mock_predict(processed_input)
-                
-        # Step 3: Calculate mean RUL and uncertainty
-        mean_rul = float(np.mean(predictions))
-        uncertainty = float(np.std(predictions))
-        
-        # Step 4: Pass through the Copilot Agent rules
-        status, recommendation = mock_evaluate(mean_rul, uncertainty)
 
-        return PredictionOutput(
-            engine_id=data.engine_id,
-            predicted_rul=mean_rul,
-            uncertainty_std=uncertainty,
-            recommendation=recommendation,
-            status=status
+@app.get("/", tags=["Info"])
+async def root():
+    return {
+        "service": "Turbofan RUL OpsCopilot API",
+        "status": "online",
+        "docs_url": "/docs",
+        "version": "1.0.0",
+    }
+
+
+@app.get("/health", response_model=HealthResponse, tags=["Monitoring"])
+async def health_check():
+    return HealthResponse(
+        status="HEALTHY",
+        model_loaded=True,
+        device=str(DEVICE),
+        version="1.0.0",
+    )
+
+
+@app.post("/predict", response_model=PredictionResponse, tags=["Inference"])
+async def predict_rul(data: PredictionRequest):
+    """Predicts Remaining Useful Life with Monte Carlo Dropout uncertainty and safety evaluation."""
+    try:
+        # 1. Format input sequence
+        if data.sequence is not None and len(data.sequence) > 0:
+            raw_seq = data.sequence
+        elif data.sensor_readings is not None and len(data.sensor_readings) > 0:
+            # Replicate single cycle reading to create sequence window
+            raw_seq = [data.sensor_readings for _ in range(preprocessor.sequence_length)]
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="Must provide either a 2D 'sequence' or a 1D 'sensor_readings' array.",
+            )
+
+        # 2. Preprocess and convert to PyTorch tensor
+        processed_window = preprocessor.transform_single_window(raw_seq)
+        input_tensor = torch.tensor(processed_window, dtype=torch.float32, device=DEVICE)
+
+        # 3. Monte Carlo Dropout Inference (Epistemic Uncertainty)
+        mean_rul, uncertainty_std, _ = model.predict_mc_dropout(
+            input_tensor, mc_samples=data.mc_samples
         )
 
+        # 4. Compute 95% Bayesian credible interval
+        lower_bound = max(0.0, float(mean_rul - 1.96 * uncertainty_std))
+        upper_bound = float(mean_rul + 1.96 * uncertainty_std)
+
+        # 5. OpsCopilot Safety & RAG Evaluation
+        evaluation = agent.evaluate(
+            model=model,
+            input_tensor=input_tensor,
+            mean_rul=mean_rul,
+            uncertainty_std=uncertainty_std,
+        )
+
+        return PredictionResponse(
+            engine_id=data.engine_id,
+            cycle=data.cycle,
+            predicted_rul=round(mean_rul, 2),
+            uncertainty_std=round(uncertainty_std, 2),
+            confidence_interval_95=[round(lower_bound, 2), round(upper_bound, 2)],
+            status=evaluation["status"],
+            confidence_level=evaluation["confidence_level"],
+            recommendation=evaluation["recommendation"],
+            top_degrading_sensors=evaluation["top_degrading_sensors"],
+            citations=evaluation["citations"],
+        )
+
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Inference failure: {str(e)}")
