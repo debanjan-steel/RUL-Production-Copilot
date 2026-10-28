@@ -81,6 +81,7 @@ async def predict_rul(data: PredictionRequest):
         mean_rul, uncertainty_std, _ = model.predict_mc_dropout(
             input_tensor, mc_samples=data.mc_samples
         )
+        mean_rul = max(0.0, mean_rul)
 
         # 4. Compute 95% Bayesian credible interval
         lower_bound = max(0.0, float(mean_rul - 1.96 * uncertainty_std))

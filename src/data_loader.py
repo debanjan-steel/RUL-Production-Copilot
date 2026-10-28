@@ -58,7 +58,48 @@ def download_cmapss_file(filename: str, dest_path: Path) -> bool:
         return False
 
 
-def load_cmapss_raw(dataset_id: str = "FD001") -> tuple[pd.DataFrame, pd.DataFrame, np.ndarray]:
+def generate_synthetic_cmapss(target_dir: Path | str | None = None, dataset_id: str = "FD001") -> None:
+    """Generates synthetic C-MAPSS dataset files for local testing and CI/CD without network calls."""
+    dirs_to_populate = [get_data_dir()]
+    if target_dir is not None:
+        target_path = Path(target_dir)
+        if target_path not in dirs_to_populate:
+            dirs_to_populate.append(target_path)
+
+    np.random.seed(42)
+    num_engines = 5
+    max_cycles = 50
+
+    for d in dirs_to_populate:
+        d.mkdir(parents=True, exist_ok=True)
+        # Training set
+        train_rows = []
+        for eng in range(1, num_engines + 1):
+            for cyc in range(1, max_cycles + 1):
+                settings = [0.0, 0.0, 100.0]
+                sensors = [float(i * 10.0 + np.random.randn() * 0.5) for i in range(1, 22)]
+                train_rows.append([eng, cyc] + settings + sensors)
+
+        train_df = pd.DataFrame(train_rows, columns=COLUMN_NAMES)
+        train_df.to_csv(d / f"train_{dataset_id}.txt", sep=" ", header=False, index=False)
+
+        # Test set
+        test_rows = []
+        for eng in range(1, num_engines + 1):
+            for cyc in range(1, 31):
+                settings = [0.0, 0.0, 100.0]
+                sensors = [float(i * 10.0 + np.random.randn() * 0.5) for i in range(1, 22)]
+                test_rows.append([eng, cyc] + settings + sensors)
+
+        test_df = pd.DataFrame(test_rows, columns=COLUMN_NAMES)
+        test_df.to_csv(d / f"test_{dataset_id}.txt", sep=" ", header=False, index=False)
+
+        # RUL ground truth
+        ruls = np.array([50.0] * num_engines, dtype=np.float32)
+        np.savetxt(d / f"RUL_{dataset_id}.txt", ruls, fmt="%.1f")
+
+
+def load_cmapss_raw(dataset_id: str = "FD001", data_dir: Path | None = None) -> tuple[pd.DataFrame, pd.DataFrame, np.ndarray]:
     """Loads raw C-MAPSS training, test, and ground-truth RUL files for any subset.
     
     Args:
@@ -71,7 +112,10 @@ def load_cmapss_raw(dataset_id: str = "FD001") -> tuple[pd.DataFrame, pd.DataFra
     if dataset_id not in valid_subsets:
         raise ValueError(f"Invalid dataset_id '{dataset_id}'. Choose from {valid_subsets}")
 
-    data_dir = get_data_dir()
+    if data_dir is None:
+        data_dir = get_data_dir()
+    else:
+        data_dir = Path(data_dir)
     train_path = data_dir / f"train_{dataset_id}.txt"
     test_path = data_dir / f"test_{dataset_id}.txt"
     rul_path = data_dir / f"RUL_{dataset_id}.txt"
